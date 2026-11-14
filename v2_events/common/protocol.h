@@ -15,14 +15,14 @@
 #include <chrono>
 #include <string>
 
-constexpr uint16_t DEFAULT_PORT = 7777;
+inline constexpr uint16_t DEFAULT_PORT = 7777;
 
 enum MsgType : uint8_t {
     MSG_HELLO = 1,   // "я здесь": первое сообщение и периодический keepalive
     MSG_VALUE = 2,   // игрок прислал новое число
 };
 
-constexpr size_t CLIENT_MSG_SIZE = 13;
+inline constexpr size_t CLIENT_MSG_SIZE = 13;
 
 struct ClientMsg {
     uint8_t type = MSG_HELLO;
