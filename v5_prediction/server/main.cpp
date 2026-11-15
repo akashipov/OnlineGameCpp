@@ -45,13 +45,14 @@ struct Player {
     float x = 0, y = 0, aim = 0;
     uint8_t score = 0;
     bool alive = true;
-    float cooldown = 0;              // сколько ждать до следующего выстрела
+    int fireCooldown = 0;            // сколько ВВОДОВ ждать до следующего выстрела (см. tryFire)
 
     std::deque<InputMsg> inputs;     // пришедшие, но ещё не применённые вводы
     uint32_t lastReceivedSeq = 0;    // самый новый пришедший seq (старые/дубли выбрасываем)
     uint32_t lastProcessedSeq = 0;   // последний применённый seq — уходит клиенту в состоянии
     float inputTokens = 0;           // сколько вводов можно применить (копится по реальному времени)
-    bool wantsFire = false;          // в каком-то из применённых за тик вводов была нажата стрельба
+    bool hasShot = false;            // в одном из применённых за тик вводов был выстрел
+    Shot shot{};                     // откуда и куда (посчитано на ТОМ САМОМ вводе)
     JitterMeter arrival;             // насколько неровно приходят вводы этого игрока
     int bufferTicks = 1;             // на сколько тиков придерживаем его вводы (для HUD/лога)
 
@@ -168,10 +169,7 @@ public:
                 break;
         }
 
-        for (auto& [key, p] : players_) {
-            p.cooldown = std::max(0.0f, p.cooldown - dt);
-            p.wantsFire = false;
-        }
+        for (auto& [key, p] : players_) p.hasShot = false;
     }
 
     // ---------- Рассылка состояния всем ----------
@@ -244,7 +242,11 @@ private:
                 p.aim = in.aim;
                 // ТА ЖЕ функция, что у клиента в предсказании
                 if (canMove(phase_, p.alive)) applyMovement(p.x, p.y, in.keys, INPUT_DT);
-                if (in.keys & IN_FIRE) p.wantsFire = true;
+                // выстрел — на этом же вводе, из позиции и с прицелом этого ввода (как у клиента)
+                if (tryFire(p.fireCooldown, in.keys, canShoot(phase_, p.alive))) {
+                    p.shot = makeShot(p.x, p.y, p.aim);
+                    p.hasShot = true;
+                }
             }
 
             // Вводы, которым уже пора, но на них нет бюджета, — хвост, сам он не уйдёт. Выбрасываем старые.
@@ -310,8 +312,8 @@ private:
         if (p.id == 1) { p.x = 150;            p.aim = 0; }
         else           { p.x = MAP_SIZE - 150; p.aim = (float)M_PI; }
         p.alive = true;
-        p.cooldown = 0;
-        p.wantsFire = false;
+        p.fireCooldown = 0;
+        p.hasShot = false;
     }
 
     // ---------- Раунды ----------
@@ -362,15 +364,10 @@ private:
 
     void shoot() {
         for (auto& [key, p] : players_) {
-            if (!p.alive || !p.wantsFire || p.cooldown > 0) continue;
+            if (!p.alive || !p.hasShot) continue;
             if ((int)bullets_.size() >= MAX_BULLETS) return;
-
-            float cx = std::cos(p.aim), cy = std::sin(p.aim);
-            float start = GUN_LENGTH;   // пуля появляется на конце ствола
-            bullets_.push_back({p.x + cx * start, p.y + cy * start,
-                                cx * BULLET_SPEED, cy * BULLET_SPEED,
-                                BULLET_LIFETIME, p.id});
-            p.cooldown = SHOOT_COOLDOWN;
+            // решение "стрелять или нет" и точка вылета уже посчитаны в processInputs (tryFire)
+            bullets_.push_back({p.shot.x, p.shot.y, p.shot.vx, p.shot.vy, BULLET_LIFETIME, p.id});
         }
     }
 

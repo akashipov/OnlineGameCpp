@@ -151,6 +151,37 @@ inline void applyMovement(float& x, float& y, uint8_t keys, float dt) {
     y = std::clamp(y, PLAYER_RADIUS, MAP_SIZE - PLAYER_RADIUS);
 }
 
+// ---------- ОБЩЕЕ ПРАВИЛО ВЫСТРЕЛА: одинаковое на клиенте и сервере ----------
+// Как и движение, выстрел решается ПО КАЖДОМУ ВВОДУ, а не по тикам сервера.
+// Поэтому клиент может сам повторить решение сервера и нарисовать пулю сразу по клику
+// (предсказание выстрела), а сервер потом подтвердит её.
+
+// Перезарядка в вводах: 0.35 с × 60 = 21 ввод между выстрелами
+inline constexpr int SHOOT_COOLDOWN_INPUTS = (int)(SHOOT_COOLDOWN * TICK_RATE + 0.5f);
+
+inline bool canShoot(uint8_t phase, bool alive) {
+    return alive && phase == PHASE_PLAYING;
+}
+
+// Вызывать для КАЖДОГО ввода по порядку. true — в этом вводе произошёл выстрел.
+inline bool tryFire(int& cooldown, uint8_t keys, bool allowed) {
+    if (cooldown > 0) cooldown--;
+    if (!(keys & IN_FIRE) || !allowed || cooldown > 0) return false;
+    cooldown = SHOOT_COOLDOWN_INPUTS;
+    return true;
+}
+
+// Где появляется пуля и куда летит: на конце ствола, по направлению прицела
+struct Shot { float x, y, vx, vy; };
+inline Shot makeShot(float px, float py, float aim) {
+    float cx = std::cos(aim), cy = std::sin(aim);
+    return {px + cx * GUN_LENGTH, py + cy * GUN_LENGTH, cx * BULLET_SPEED, cy * BULLET_SPEED};
+}
+
+// Угол уходит по сети с точностью 0.01 (см. Writer::f32). Клиент округляет его так же
+// ещё до отправки — тогда его предсказанная пуля летит ровно туда же, куда серверная.
+inline float quantizeAim(float a) { return (float)std::lround(a * 100.0f) / 100.0f; }
+
 // ---------- Запись и чтение пакетов ----------
 
 // Складывает числа в буфер байт по порядку (big-endian).

@@ -47,6 +47,21 @@ struct PendingInput {
     double sentAt;   // когда отправили — для оценки пинга
 };
 
+// Своя пуля, нарисованная СРАЗУ по клику (предсказание выстрела).
+// Сервер про неё узнает только через ~пинг; когда он подтвердит ввод с выстрелом,
+// мы проверим, что такая пуля у него действительно есть.
+struct PredictedBullet {
+    uint32_t seq;          // номер ввода, в котором был выстрел
+    Shot shot;             // откуда и с какой скоростью вылетела
+    double firedAt;        // когда (по нашим часам)
+    bool confirmed;        // сервер подтвердил, что пуля есть
+};
+
+// Скорости совпадают → это та же пуля (скорость приходит с точностью 0.01)
+bool sameShot(const BulletState& b, const Shot& s) {
+    return std::fabs(b.vx - s.vx) < 0.5f && std::fabs(b.vy - s.vy) < 0.5f;
+}
+
 // Снимок мира от сервера (для интерполяции)
 struct Snapshot {
     uint32_t tick;
@@ -114,6 +129,11 @@ int main(int argc, char** argv) {
     double inputAccumulator = 0;
     float lastCorrection = 0;        // насколько сервер поправил предсказание (для отладки)
 
+    // предсказание выстрела
+    std::vector<PredictedBullet> myBullets;
+    int fireCooldown = 0;            // перезарядка в вводах — считается так же, как на сервере (tryFire)
+    double muzzleFlashAt = -10;      // когда был последний свой выстрел (для вспышки у дула)
+
     double rttMs = 0;                // оценка пинга
     double lastHelloAt = -10;
     double lastPacketAt = GetTime();
@@ -121,7 +141,10 @@ int main(int argc, char** argv) {
     while (!WindowShouldClose()) {
         double now = GetTime();
 
-        if (IsKeyPressed(KEY_P)) predictionOn = !predictionOn;
+        if (IsKeyPressed(KEY_P)) {
+            predictionOn = !predictionOn;
+            myBullets.clear();   // без предсказания свои пули снова рисуются из снимков сервера
+        }
         if (IsKeyPressed(KEY_I)) interpolationOn = !interpolationOn;
 
         // ---------- 1. Приём ----------
@@ -176,6 +199,21 @@ int main(int argc, char** argv) {
                     predX = x;
                     predY = y;
                     havePrediction = true;
+
+                    // ---- подтверждение своих выстрелов ----
+                    // Раунд кончился (кто-то попал) — сервер очистил пули, очищаем и мы.
+                    if (s.phase != PHASE_PLAYING) myBullets.clear();
+                    // Сервер уже учёл ввод с выстрелом → такая пуля должна быть в снимке.
+                    // Нет — значит, сервер выстрел не принял (перезарядка, фаза): убираем свою.
+                    for (size_t i = 0; i < myBullets.size(); ) {
+                        PredictedBullet& pb = myBullets[i];
+                        if (!pb.confirmed && pb.seq <= me->lastInputSeq) {
+                            for (const auto& b : s.bullets)
+                                if (b.owner == myId && sameShot(b, pb.shot)) pb.confirmed = true;
+                            if (!pb.confirmed) { myBullets.erase(myBullets.begin() + i); continue; }
+                        }
+                        i++;
+                    }
                 }
             }
         }
@@ -211,11 +249,19 @@ int main(int argc, char** argv) {
                     if (IsKeyDown(KEY_A)) in.keys |= IN_LEFT;
                     if (IsKeyDown(KEY_D)) in.keys |= IN_RIGHT;
                     if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsKeyDown(KEY_SPACE)) in.keys |= IN_FIRE;
-                    in.aim = myAim;
+                    in.aim = quantizeAim(myAim);   // с той же точностью, что уйдёт по сети
 
                     // ---- PREDICTION: двигаем себя сразу, той же функцией, что и сервер ----
                     if (havePrediction && meServer && canMove(latest.phase, meServer->alive)) {
                         applyMovement(predX, predY, in.keys, INPUT_DT);
+                    }
+
+                    // ---- PREDICTION выстрела: то же правило, что на сервере (tryFire) ----
+                    // Перезарядку считаем всегда, даже без предсказания, — чтобы не разойтись с сервером.
+                    bool allowed = meServer && canShoot(latest.phase, meServer->alive);
+                    if (tryFire(fireCooldown, in.keys, allowed) && predictionOn && havePrediction) {
+                        myBullets.push_back({in.seq, makeShot(predX, predY, in.aim), now, false});
+                        muzzleFlashAt = now;
                     }
 
                     pending.push_back({in, now});
@@ -269,9 +315,27 @@ int main(int argc, char** argv) {
             // чужие — из того же момента, в котором рисуем соперника (чтобы попадания выглядели честно)
             // Свою пулю досчитываем сами: позиция из пакета + скорость × время с его прихода.
             // Иначе при залипании сети пуля висит в воздухе, а потом прыгает.
+            //
+            // С предсказанием свои пули рисуем из myBullets: они вылетели из ствола в момент клика
+            // и летят сами. Серверные свои пули рисуем, только если у них нет предсказанной пары
+            // (например, выстрел пришёлся на начало раунда, которое клиент ещё не увидел).
+            for (size_t i = 0; i < myBullets.size(); ) {
+                const PredictedBullet& pb = myBullets[i];
+                float age = (float)(now - pb.firedAt);
+                float bx = pb.shot.x + pb.shot.vx * age, by = pb.shot.y + pb.shot.vy * age;
+                if (age > BULLET_LIFETIME || bx < 0 || by < 0 || bx > MAP_SIZE || by > MAP_SIZE) {
+                    myBullets.erase(myBullets.begin() + i);   // улетела за стену — как и на сервере
+                    continue;
+                }
+                DrawCircleV(Vector2{bx, by + HUD_HEIGHT}, BULLET_RADIUS, DARKBLUE);
+                i++;
+            }
             float flight = (float)std::min(now - latestAt, 0.3);
             for (const auto& b : latest.bullets) {
                 if (b.owner != myId) continue;
+                bool predicted = false;
+                for (const auto& pb : myBullets) if (pb.confirmed && sameShot(b, pb.shot)) predicted = true;
+                if (predicted) continue;   // её уже нарисовали выше — из ствола, без задержки
                 float bx = b.x + b.vx * flight, by = b.y + b.vy * flight;
                 if (bx < 0 || by < 0 || bx > MAP_SIZE || by > MAP_SIZE) continue;   // уже улетела за стену
                 DrawCircleV(Vector2{bx, by + HUD_HEIGHT}, BULLET_RADIUS, DARKBLUE);
@@ -302,6 +366,11 @@ int main(int argc, char** argv) {
                 Vector2 tip{pos.x + std::cos(aim) * GUN_LENGTH,
                             pos.y + std::sin(aim) * GUN_LENGTH};
                 DrawLineEx(pos, tip, 4, DARKGRAY);
+                // вспышка выстрела у дула — в тот же кадр, что и клик
+                if (p.id == myId && now - muzzleFlashAt < 0.06) {
+                    float k = 1.0f - (float)((now - muzzleFlashAt) / 0.06);
+                    DrawCircleV(tip, 6 + 4 * k, Fade(ORANGE, 0.9f * k));
+                }
                 DrawCircleV(pos, PLAYER_RADIUS, body);
                 DrawText(p.id == myId ? "you" : TextFormat("P%d", p.id),
                          (int)pos.x - 12, (int)pos.y - (int)PLAYER_RADIUS - 18, 14, DARKGRAY);
