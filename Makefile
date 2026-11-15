@@ -93,11 +93,21 @@ client-v3: $(BUILD)/v3_client
 # Клиенту нужна библиотека raylib:  brew install raylib
 # Серверу raylib НЕ нужен — его можно собирать на Linux-сервере как обычно.
 
+ifeq ($(OS),Windows_NT)
+# Windows: папка, куда распакован готовый raylib (mingw-w64). Можно переопределить:
+# make build-v4 RAYLIB_PATH=D:/libs/raylib-6.2_win64_mingw-w64
+RAYLIB_PATH   ?= C:/raylib/raylib-6.2_win64_mingw-w64
+RAYLIB_CFLAGS = -I$(RAYLIB_PATH)/include
+RAYLIB_LIBS   = -L$(RAYLIB_PATH)/lib -lraylib -lopengl32 -lgdi32 -lwinmm
+# net.cpp (v5) использует Winsock на Windows
+WS2_LIBS      = -lws2_32
+else
 # Где Homebrew хранит библиотеки (обычно /opt/homebrew).
 # "=" а не ":=" — команда brew выполнится, только когда собираем клиент v4.
 BREW_PREFIX   = $(shell brew --prefix 2>/dev/null)
 RAYLIB_CFLAGS = -I$(BREW_PREFIX)/include
 RAYLIB_LIBS   = -L$(BREW_PREFIX)/lib -lraylib
+endif
 
 build-v4: $(BUILD)/v4_server $(BUILD)/v4_client
 
@@ -123,9 +133,9 @@ $(BUILD)/v5_server: v5_prediction/server/main.cpp v5_prediction/common/protocol.
 	@mkdir -p $(BUILD)
 	$(CXX) $(CXXFLAGS) v5_prediction/server/main.cpp -o $(BUILD)/v5_server
 
-$(BUILD)/v5_client: v5_prediction/client/main.cpp v5_prediction/common/protocol.h
+$(BUILD)/v5_client: v5_prediction/client/main.cpp v5_prediction/client/net.cpp v5_prediction/client/net.h v5_prediction/common/protocol.h
 	@mkdir -p $(BUILD)
-	$(CXX) $(CXXFLAGS) $(RAYLIB_CFLAGS) v5_prediction/client/main.cpp -o $(BUILD)/v5_client $(RAYLIB_LIBS)
+	$(CXX) $(CXXFLAGS) $(RAYLIB_CFLAGS) v5_prediction/client/main.cpp v5_prediction/client/net.cpp -o $(BUILD)/v5_client $(RAYLIB_LIBS) $(WS2_LIBS)
 
 server-v5: $(BUILD)/v5_server
 	./$(BUILD)/v5_server $(PORT)

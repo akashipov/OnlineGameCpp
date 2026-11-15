@@ -291,7 +291,11 @@ inline std::string formatUtc(uint64_t us) {
     time_t seconds = (time_t)(us / 1000000);
     unsigned millis = (unsigned)((us % 1000000) / 1000);
     tm t{};
+#if defined(_WIN32)
+    gmtime_s(&t, &seconds);
+#else
     gmtime_r(&seconds, &t);
+#endif
     char date[32];
     strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &t);
     char out[48];

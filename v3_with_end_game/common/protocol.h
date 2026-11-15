@@ -103,7 +103,11 @@ inline std::string formatUtc(uint64_t us) {
     unsigned millis = (unsigned)((us % 1000000) / 1000);
 
     tm t{};
-    gmtime_r(&seconds, &t);                 // разложить секунды на дату/время по UTC
+#if defined(_WIN32)
+    gmtime_s(&t, &seconds);
+#else
+    gmtime_r(&seconds, &t);
+#endif                 // разложить секунды на дату/время по UTC
 
     char date[32];
     strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &t);
