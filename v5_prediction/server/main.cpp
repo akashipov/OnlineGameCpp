@@ -209,7 +209,9 @@ private:
             // +1 ввод за каждые 1/60 с реального времени, копится до MAX_INPUT_BURST
             p.inputTokens = std::min(p.inputTokens + elapsed * TICK_RATE, (float)MAX_INPUT_BURST);
 
-            while (p.inputTokens >= 1.0f && !p.inputs.empty()) {
+            int appliedThisTick = 0;
+            while (p.inputTokens >= 1.0f && !p.inputs.empty() && appliedThisTick < MAX_INPUTS_PER_TICK) {
+                appliedThisTick++;
                 InputMsg in = p.inputs.front();
                 p.inputs.pop_front();
                 p.inputTokens -= 1.0f;
@@ -221,9 +223,10 @@ private:
                 if (in.keys & IN_FIRE) p.wantsFire = true;
             }
 
-            // Бюджет кончился, а в очереди хвост — сам он не уйдёт. Выбрасываем старые вводы.
+            // Вводы сверх бюджета никогда не догонят — это хвост, сам он не уйдёт. Выбрасываем старые.
+            // (Вводы, на которые бюджет есть, остаются: применятся в следующих тиках по 3 штуки.)
             int dropped = 0;
-            while ((int)p.inputs.size() > MAX_INPUT_BACKLOG) {
+            while ((int)p.inputs.size() > (int)p.inputTokens + MAX_INPUT_BACKLOG) {
                 p.lastProcessedSeq = p.inputs.front().seq;   // клиент тоже их забудет
                 p.inputs.pop_front();
                 dropped++;

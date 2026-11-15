@@ -16,8 +16,9 @@
 //    Если нет (сервер сдвинул на спавн, потерялся пакет) — позиция поправится.
 //
 // 3. INTERPOLATION (плавный соперник).
-//    Соперника рисуем чуть "в прошлом" (INTERP_DELAY) — между двумя полученными
-//    снимками мира. Так он двигается плавно, даже если пакеты приходят неровно.
+//    Соперника рисуем чуть "в прошлом" — между двумя полученными снимками мира.
+//    Какой момент рисовать, решает RenderClock (render_clock.h): он идёт ровно
+//    с реальным временем и сам подбирает запас под неровность сети.
 //
 // Запуск:  ./v5_client [host] [port]     (по умолчанию 127.0.0.1 7777)
 // Нужна библиотека raylib:  brew install raylib
@@ -38,14 +39,11 @@
 
 #include "raylib.h"
 #include "../common/protocol.h"
+#include "render_clock.h"
 
 constexpr int HUD_HEIGHT = 40;
 constexpr int WINDOW_W = (int)MAP_SIZE;
 constexpr int WINDOW_H = (int)MAP_SIZE + HUD_HEIGHT;
-
-// Насколько "в прошлом" рисуем соперника: 6 тиков = 100 мс.
-// Запас нужен, чтобы почти всегда был "следующий" снимок, к которому плавно двигаться.
-constexpr float INTERP_DELAY_TICKS = 6.0f;
 
 // Ввод, отправленный серверу, но ещё не подтверждённый им
 struct PendingInput {
@@ -121,9 +119,9 @@ int main(int argc, char** argv) {
 
     StateMsg latest;                 // самое свежее состояние (фаза, счёт, кто жив)
     bool haveState = false;
-    double latestAt = 0;             // когда (по нашим часам) пришло latest
 
     std::deque<Snapshot> snapshots;  // история для интерполяции (~1 с)
+    RenderClock renderClock;         // какой момент сервера рисовать для соперника
 
     GameEndMsg gameEnd;
     bool gameOver = false;
@@ -170,7 +168,7 @@ int main(int argc, char** argv) {
                 if (haveState && s.tick <= latest.tick) continue;   // устаревший пакет
                 latest = s;
                 haveState = true;
-                latestAt = now;
+                renderClock.onSnapshot(s.tick, now, TICK_RATE);
 
                 snapshots.push_back({s.tick, s.players, s.bullets});
                 while (snapshots.size() > 60) snapshots.pop_front();
@@ -252,20 +250,29 @@ int main(int argc, char** argv) {
         if (predictionOn && havePrediction) { myX = predX; myY = predY; }
 
         // ---------- 3. INTERPOLATION: находим два снимка вокруг "времени отрисовки" ----------
-        // Оцениваем текущий тик сервера и отступаем назад на INTERP_DELAY_TICKS
-        double renderTick = haveState
-            ? latest.tick + (now - latestAt) * TICK_RATE - INTERP_DELAY_TICKS
-            : 0;
+        renderClock.advance(now, GetFrameTime(), TICK_RATE);
+        double renderTick = renderClock.renderTick;
         const Snapshot* from = nullptr;
         const Snapshot* to = nullptr;
-        for (size_t i = 0; i + 1 < snapshots.size(); i++) {
-            if (snapshots[i].tick <= renderTick && renderTick < snapshots[i + 1].tick) {
-                from = &snapshots[i];
-                to = &snapshots[i + 1];
-                break;
+        float t = 0;
+        if (!snapshots.empty()) {
+            if (renderTick >= snapshots.back().tick) {
+                // свежее снимков нет (пакет опоздал сильнее запаса) — стоим на последнем,
+                // а не прыгаем куда-то: часы сами чуть замедлятся
+                from = to = &snapshots.back();
+            } else if (renderTick < snapshots.front().tick) {
+                from = to = &snapshots.front();
+            } else {
+                for (size_t i = 0; i + 1 < snapshots.size(); i++) {
+                    if (snapshots[i].tick <= renderTick && renderTick < snapshots[i + 1].tick) {
+                        from = &snapshots[i];
+                        to = &snapshots[i + 1];
+                        t = (float)((renderTick - from->tick) / (double)(to->tick - from->tick));
+                        break;
+                    }
+                }
             }
         }
-        float t = (from && to) ? (float)((renderTick - from->tick) / (double)(to->tick - from->tick)) : 0;
 
         // ---------- 4. Рисование ----------
         BeginDrawing();
@@ -327,10 +334,10 @@ int main(int argc, char** argv) {
             DrawText(TextFormat("You %d : %d Enemy", myScore, enemyScore), 190, 10, 20, RAYWHITE);
         }
         // ping — от отправки ввода до его применения сервером (сеть туда-обратно + ожидание в очереди сервера)
-        // queue — сколько вводов отправлено, но ещё не подтверждено (норма: ping / 16.7 мс)
-        DrawText(TextFormat("ping %.0f ms | queue %d | [P]red %s | [I]nterp %s | fix %.1f",
-                            rttMs, (int)pending.size(), predictionOn ? "ON" : "off",
-                            interpolationOn ? "ON" : "off", lastCorrection),
+        // interp — насколько в прошлом рисуем соперника (растёт, если сеть неровная)
+        DrawText(TextFormat("ping %.0f | interp %.0f ms | [P]red %s | [I]nterp %s | fix %.1f",
+                            rttMs, renderClock.delayTicks * 1000.0 / TICK_RATE,
+                            predictionOn ? "ON" : "off", interpolationOn ? "ON" : "off", lastCorrection),
                  390, 13, 14, GRAY);
 
         int midY = HUD_HEIGHT + (int)MAP_SIZE / 2 - 60;
