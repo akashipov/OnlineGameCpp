@@ -6,7 +6,8 @@
 //     делает клиент у себя для предсказания;
 //   - в состоянии для каждого игрока передаётся lastInputSeq — номер последнего
 //     применённого INPUT. По нему клиент понимает, какие свои вводы сервер уже учёл;
-//   - "бюджет вводов": в среднем не больше 1 ввода на тик (защита от speedhack).
+//   - "бюджет вводов" копится по реальному времени: пачку опоздавших вводов сервер
+//     применяет сразу, но в среднем быстрее реального времени двигаться нельзя (защита от speedhack).
 //
 // Сервер ничего не рисует — только считает мир и рассылает его.
 //
@@ -48,7 +49,7 @@ struct Player {
     std::deque<InputMsg> inputs;     // пришедшие, но ещё не применённые вводы
     uint32_t lastReceivedSeq = 0;    // самый новый пришедший seq (старые/дубли выбрасываем)
     uint32_t lastProcessedSeq = 0;   // последний применённый seq — уходит клиенту в состоянии
-    int inputBudget = 0;             // сколько вводов можно применить в этот тик
+    float inputTokens = 0;           // сколько вводов можно применить (копится по реальному времени)
     bool wantsFire = false;          // в каком-то из применённых за тик вводов была нажата стрельба
 
     Clock::time_point lastSeen;
@@ -112,8 +113,10 @@ public:
             if (in.seq <= p.lastReceivedSeq) return;   // дубль или опоздавший пакет
             if (!std::isfinite(in.aim)) return;
             p.lastReceivedSeq = in.seq;
-            // очередь ограничена: если клиент шлёт слишком много — лишнее просто выбрасываем
-            if (p.inputs.size() < 30) p.inputs.push_back(in);
+            // очередь ограничена: при переполнении выбрасываем самый СТАРЫЙ ввод,
+            // иначе задержка управления "застрянет" на максимуме
+            if ((int)p.inputs.size() >= MAX_QUEUED_INPUTS) p.inputs.pop_front();
+            p.inputs.push_back(in);
         } else if (type == MSG_LEAVE) {
             removePlayer(key, "left the game");
         }
@@ -125,7 +128,14 @@ public:
         tick_++;
         dropSilentPlayers();
 
-        processInputs();   // движение — здесь, ровно по присланным вводам
+        // сколько РЕАЛЬНОГО времени прошло с прошлого тика (если сервер подвис — больше dt)
+        auto now = Clock::now();
+        float elapsed = lastUpdate_ == Clock::time_point{}
+            ? dt
+            : std::chrono::duration<float>(now - lastUpdate_).count();
+        lastUpdate_ = now;
+
+        processInputs(elapsed);   // движение — здесь, ровно по присланным вводам
 
         switch (phase_) {
             case PHASE_WAITING:
@@ -194,15 +204,15 @@ private:
 
     // ---------- Вводы ----------
 
-    void processInputs() {
+    void processInputs(float elapsed) {
         for (auto& [key, p] : players_) {
-            // +1 ввод за тик, но можно накопить до MAX_INPUT_BURST, если пакеты пришли пачкой
-            p.inputBudget = std::min(p.inputBudget + 1, MAX_INPUT_BURST);
+            // +1 ввод за каждые 1/60 с реального времени, копится до MAX_INPUT_BURST
+            p.inputTokens = std::min(p.inputTokens + elapsed * TICK_RATE, (float)MAX_INPUT_BURST);
 
-            while (p.inputBudget > 0 && !p.inputs.empty()) {
+            while (p.inputTokens >= 1.0f && !p.inputs.empty()) {
                 InputMsg in = p.inputs.front();
                 p.inputs.pop_front();
-                p.inputBudget--;
+                p.inputTokens -= 1.0f;
 
                 p.lastProcessedSeq = in.seq;
                 p.aim = in.aim;
@@ -371,6 +381,7 @@ private:
     int round_ = 0;
     uint8_t lastScorer_ = 0;
     uint32_t tick_ = 0;
+    Clock::time_point lastUpdate_{};
 };
 
 int main(int argc, char** argv) {

@@ -326,9 +326,12 @@ int main(int argc, char** argv) {
             DrawText(TextFormat("Round %d/%d", latest.round, latest.roundsTotal), 12, 10, 20, RAYWHITE);
             DrawText(TextFormat("You %d : %d Enemy", myScore, enemyScore), 190, 10, 20, RAYWHITE);
         }
-        DrawText(TextFormat("ping %.0f ms | [P]rediction %s | [I]nterp %s | fix %.1f",
-                            rttMs, predictionOn ? "ON" : "off", interpolationOn ? "ON" : "off", lastCorrection),
-                 420, 13, 14, GRAY);
+        // ping — от отправки ввода до его применения сервером (сеть туда-обратно + ожидание в очереди сервера)
+        // queue — сколько вводов отправлено, но ещё не подтверждено (норма: ping / 16.7 мс)
+        DrawText(TextFormat("ping %.0f ms | queue %d | [P]red %s | [I]nterp %s | fix %.1f",
+                            rttMs, (int)pending.size(), predictionOn ? "ON" : "off",
+                            interpolationOn ? "ON" : "off", lastCorrection),
+                 390, 13, 14, GRAY);
 
         int midY = HUD_HEIGHT + (int)MAP_SIZE / 2 - 60;
         if (gameOver) {
