@@ -21,14 +21,9 @@
 //    с реальным временем и сам подбирает запас под неровность сети.
 //
 // Запуск:  ./v5_client [host] [port]     (по умолчанию 127.0.0.1 7777)
-// Нужна библиотека raylib:  brew install raylib
+// Нужна библиотека raylib:  brew install raylib  (Windows: см. README_WINDOWS.md)
+// Работает на Mac, Linux и Windows: всё, что отличается между системами (сокеты), — в net.cpp.
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +35,7 @@
 #include "raylib.h"
 #include "../common/protocol.h"
 #include "render_clock.h"
+#include "net.h"
 
 constexpr int HUD_HEIGHT = 40;
 constexpr int WINDOW_W = (int)MAP_SIZE;
@@ -58,24 +54,8 @@ struct Snapshot {
     std::vector<BulletState> bullets;
 };
 
-bool resolve(const char* host, uint16_t port, sockaddr_in& out) {
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo* res = nullptr;
-    int err = getaddrinfo(host, nullptr, &hints, &res);
-    if (err != 0) {
-        printf("Cannot resolve %s: %s\n", host, gai_strerror(err));
-        return false;
-    }
-    memcpy(&out, res->ai_addr, sizeof(out));
-    out.sin_port = htons(port);
-    freeaddrinfo(res);
-    return true;
-}
-
-void sendPacket(int sock, const sockaddr_in& server, const Writer& w) {
-    sendto(sock, w.data(), w.size(), 0, (const sockaddr*)&server, sizeof(server));
+void sendPacket(UdpClient& net, const Writer& w) {
+    net.send(w.data(), w.size());
 }
 
 void drawCentered(const char* text, int y, int fontSize, Color color) {
@@ -92,7 +72,8 @@ float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 // Плавный переход угла (через кратчайшую сторону, чтобы не крутиться на 350° вместо 10°)
 float lerpAngle(float a, float b, float t) {
-    float d = std::remainder(b - a, 2.0f * (float)M_PI);
+    // PI — из raylib.h (M_PI из <cmath> есть не во всех компиляторах, на Windows его нет)
+    float d = std::remainder(b - a, 2.0f * PI);
     return a + d * t;
 }
 
@@ -101,12 +82,8 @@ int main(int argc, char** argv) {
     uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : DEFAULT_PORT;
 
     // ---------- Сеть ----------
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) { perror("socket"); return 1; }
-    fcntl(sock, F_SETFL, O_NONBLOCK);
-
-    sockaddr_in server{};
-    if (!resolve(host, port, server)) return 1;
+    UdpClient net;
+    if (!net.open(host, port)) return 1;
 
     // ---------- Окно ----------
     SetTraceLogLevel(LOG_WARNING);
@@ -150,8 +127,8 @@ int main(int argc, char** argv) {
         // ---------- 1. Приём ----------
         while (true) {
             uint8_t buf[2048];
-            ssize_t n = recvfrom(sock, buf, sizeof(buf), 0, nullptr, nullptr);
-            if (n <= 0) break;
+            int n = net.receive(buf, sizeof(buf));
+            if (n <= 0) break;   // пакетов больше нет
             lastPacketAt = now;
 
             Reader r(buf, (size_t)n);
@@ -217,7 +194,7 @@ int main(int argc, char** argv) {
         if (!gameOver && !serverFull) {
             if (myId == 0) {
                 if (now - lastHelloAt > 0.5) {
-                    sendPacket(sock, server, encodeHello());
+                    sendPacket(net, encodeHello());
                     lastHelloAt = now;
                 }
             } else {
@@ -248,7 +225,7 @@ int main(int argc, char** argv) {
                     int count = 0;
                     size_t first = pending.size() > (size_t)INPUT_REDUNDANCY ? pending.size() - INPUT_REDUNDANCY : 0;
                     for (size_t i = first; i < pending.size(); i++) recent[count++] = pending[i].in;
-                    sendPacket(sock, server, encodeInput(recent, count));
+                    sendPacket(net, encodeInput(recent, count));
                 }
             }
         }
@@ -389,8 +366,8 @@ int main(int argc, char** argv) {
         EndDrawing();
     }
 
-    if (myId != 0 && !gameOver) sendPacket(sock, server, encodeLeave());
+    if (myId != 0 && !gameOver) sendPacket(net, encodeLeave());
     CloseWindow();
-    close(sock);
+    net.close();
     return 0;
 }
