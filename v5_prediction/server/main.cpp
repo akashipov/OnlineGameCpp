@@ -220,6 +220,17 @@ private:
                 if (canMove(phase_, p.alive)) applyMovement(p.x, p.y, in.keys, INPUT_DT);
                 if (in.keys & IN_FIRE) p.wantsFire = true;
             }
+
+            // Бюджет кончился, а в очереди хвост — сам он не уйдёт. Выбрасываем старые вводы.
+            int dropped = 0;
+            while ((int)p.inputs.size() > MAX_INPUT_BACKLOG) {
+                p.lastProcessedSeq = p.inputs.front().seq;   // клиент тоже их забудет
+                p.inputs.pop_front();
+                dropped++;
+            }
+            if (dropped > 0)
+                logLine("Player " + std::to_string(p.id) + ": dropped " + std::to_string(dropped) +
+                        " late inputs (~" + std::to_string(dropped * 1000 / TICK_RATE) + " ms backlog)");
         }
     }
 
