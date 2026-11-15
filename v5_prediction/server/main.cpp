@@ -32,6 +32,7 @@
 #include <unordered_map>
 
 #include "../common/protocol.h"
+#include "../common/jitter.h"
 
 using Clock = std::chrono::steady_clock;
 
@@ -51,6 +52,8 @@ struct Player {
     uint32_t lastProcessedSeq = 0;   // последний применённый seq — уходит клиенту в состоянии
     float inputTokens = 0;           // сколько вводов можно применить (копится по реальному времени)
     bool wantsFire = false;          // в каком-то из применённых за тик вводов была нажата стрельба
+    JitterMeter arrival;             // насколько неровно приходят вводы этого игрока
+    int bufferTicks = 1;             // на сколько тиков придерживаем его вводы (для HUD/лога)
 
     Clock::time_point lastSeen;
 };
@@ -115,6 +118,7 @@ public:
                 if (in.seq <= p.lastReceivedSeq) continue;   // уже получали (дубль) или старый пакет
                 if (!std::isfinite(in.aim)) return;
                 p.lastReceivedSeq = in.seq;
+                p.arrival.add((double)in.seq - nowTicks());
                 // очередь ограничена: при переполнении выбрасываем самый СТАРЫЙ ввод,
                 // иначе задержка управления "застрянет" на максимуме
                 if ((int)p.inputs.size() >= MAX_QUEUED_INPUTS) p.inputs.pop_front();
@@ -207,13 +211,30 @@ private:
 
     // ---------- Вводы ----------
 
+    // БУФЕР ВВОДОВ (jitter buffer).
+    // Вводы игрока приходят неровно (Wi-Fi: то пауза 100 мс, то пачка). Если применять каждый
+    // сразу, игрок на сервере то стоит, то догоняет рывком — и у соперника он дёргается.
+    // Поэтому ввод №k применяем не когда он пришёл, а по расписанию:
+    //     (среднее время прихода ввода №k) + bufferTicks
+    // Ввод, опоздавший меньше чем на bufferTicks, успевает к своему времени — движение ровное.
+    // bufferTicks подбирается под сеть игрока: ровная сеть → 1 тик, Wi-Fi скачет → больше.
+    // Сам игрок задержки не замечает (у него prediction), а соперник видит его плавно.
     void processInputs(float elapsed) {
-        for (auto& [key, p] : players_) {
-            // +1 ввод за каждые 1/60 с реального времени, копится до MAX_INPUT_BURST
+        double now = nowTicks();
+        for (auto& entry : players_) {
+            Player& p = entry.second;
+            if (!p.arrival.ready()) continue;
+            p.bufferTicks = std::clamp((int)std::ceil(2.0 * p.arrival.jitterTicks), 1, MAX_INPUT_BUFFER);
+
+            // когда пора применять ввод с этим номером
+            auto dueAt = [&](const InputMsg& in) { return (double)in.seq - p.arrival.offset + p.bufferTicks; };
+
+            // +1 ввод за каждые 1/60 с реального времени, копится до MAX_INPUT_BURST (защита от speedhack)
             p.inputTokens = std::min(p.inputTokens + elapsed * TICK_RATE, (float)MAX_INPUT_BURST);
 
             int appliedThisTick = 0;
-            while (p.inputTokens >= 1.0f && !p.inputs.empty() && appliedThisTick < MAX_INPUTS_PER_TICK) {
+            while (!p.inputs.empty() && dueAt(p.inputs.front()) <= now &&
+                   p.inputTokens >= 1.0f && appliedThisTick < MAX_INPUTS_PER_TICK) {
                 appliedThisTick++;
                 InputMsg in = p.inputs.front();
                 p.inputs.pop_front();
@@ -226,18 +247,25 @@ private:
                 if (in.keys & IN_FIRE) p.wantsFire = true;
             }
 
-            // Вводы сверх бюджета никогда не догонят — это хвост, сам он не уйдёт. Выбрасываем старые.
-            // (Вводы, на которые бюджет есть, остаются: применятся в следующих тиках по 3 штуки.)
+            // Вводы, которым уже пора, но на них нет бюджета, — хвост, сам он не уйдёт. Выбрасываем старые.
+            int overdue = 0;
+            for (const auto& in : p.inputs) if (dueAt(in) <= now) overdue++;
             int dropped = 0;
-            while ((int)p.inputs.size() > (int)p.inputTokens + MAX_INPUT_BACKLOG) {
+            while (overdue > (int)p.inputTokens + MAX_INPUT_BACKLOG) {
                 p.lastProcessedSeq = p.inputs.front().seq;   // клиент тоже их забудет
                 p.inputs.pop_front();
+                overdue--;
                 dropped++;
             }
             if (dropped > 0)
                 logLine("Player " + std::to_string(p.id) + ": dropped " + std::to_string(dropped) +
                         " late inputs (~" + std::to_string(dropped * 1000 / TICK_RATE) + " ms backlog)");
         }
+    }
+
+    // текущее время сервера в тиках (дробное) — для расписания вводов
+    double nowTicks() const {
+        return std::chrono::duration<double>(Clock::now() - startTime_).count() * TICK_RATE;
     }
 
     // ---------- Игроки ----------
@@ -247,6 +275,7 @@ private:
         for (const auto& [k, p] : players_) if (p.id == 1) id = 2;
 
         Player p;
+        p.arrival.decay = 0.01;   // буфер вводов сжимается за ~2 с после разовой заминки
         p.id = id;
         p.addr = from;
         p.lastSeen = Clock::now();
@@ -399,6 +428,7 @@ private:
     uint8_t lastScorer_ = 0;
     uint32_t tick_ = 0;
     Clock::time_point lastUpdate_{};
+    Clock::time_point startTime_ = Clock::now();
 };
 
 int main(int argc, char** argv) {

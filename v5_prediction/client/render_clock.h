@@ -16,35 +16,25 @@
 #include <cmath>
 #include <cstdint>
 
+#include "../common/jitter.h"
+
 struct RenderClock {
     double renderTick = 0;   // какой момент сервера рисуем (дробный тик)
     double delayTicks = 6;   // насколько отстаём от самого свежего (для HUD)
-    double jitterTicks = 1;  // насколько неровно приходят пакеты, в тиках
+    JitterMeter meter;       // насколько неровно приходят снимки
 
     // Вызывать для КАЖДОГО полученного снимка
     void onSnapshot(uint32_t tick, double now, int tickRate) {
-        // "какой тик сервера сейчас" по этому пакету, если считать, что он пришёл без задержки
-        double sample = (double)tick - now * tickRate;
-        if (!init_) {
-            offset_ = sample;
-            renderTick = tick - delayTicks;
-            init_ = true;
-            return;
-        }
-        double dev = sample - offset_;
-        offset_ += dev * 0.05;   // средняя задержка сети, плавно
-
-        // jitter растёт быстро (скачок сети), а уменьшается медленно (через несколько секунд),
-        // чтобы после одного скачка не сократить запас и не словить следующий
-        double a = std::fabs(dev) > jitterTicks ? 0.1 : 0.005;
-        jitterTicks += (std::fabs(dev) - jitterTicks) * a;
+        bool first = !meter.ready();
+        meter.add((double)tick - now * tickRate);
+        if (first) renderTick = tick - delayTicks;
     }
 
     // Вызывать каждый кадр
     void advance(double now, double frameDt, int tickRate) {
-        if (!init_) return;
-        delayTicks = std::clamp(2.0 + 3.0 * jitterTicks, 3.0, 30.0);
-        double target = now * tickRate + offset_ - delayTicks;
+        if (!meter.ready()) return;
+        delayTicks = std::clamp(2.0 + 3.0 * meter.jitterTicks, 3.0, 30.0);
+        double target = now * tickRate + meter.offset - delayTicks;
         double err = target - renderTick;
 
         if (std::fabs(err) > 30) {
@@ -55,8 +45,4 @@ struct RenderClock {
             renderTick += frameDt * tickRate * speed;
         }
     }
-
-private:
-    bool init_ = false;
-    double offset_ = 0;   // (тик сервера) - (наше время × tickRate), сглаженное
 };

@@ -87,6 +87,9 @@ inline constexpr int MAX_INPUT_BACKLOG = 2;   // ~33 мс запаса на не
 // По 3 за тик: он догоняет за несколько тиков (быстро, но плавно).
 inline constexpr int MAX_INPUTS_PER_TICK = 3;
 
+// Буфер вводов на сервере (см. processInputs): максимум 12 тиков = 200 мс.
+inline constexpr int MAX_INPUT_BUFFER = 12;
+
 // ---------- Ввод: биты в одном байте ----------
 
 enum InputKeys : uint8_t {
