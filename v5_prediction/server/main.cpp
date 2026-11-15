@@ -108,15 +108,18 @@ public:
         p.lastSeen = Clock::now();
 
         if (type == MSG_INPUT) {
-            InputMsg in;
-            if (!decodeInput(r, in)) return;
-            if (in.seq <= p.lastReceivedSeq) return;   // дубль или опоздавший пакет
-            if (!std::isfinite(in.aim)) return;
-            p.lastReceivedSeq = in.seq;
-            // очередь ограничена: при переполнении выбрасываем самый СТАРЫЙ ввод,
-            // иначе задержка управления "застрянет" на максимуме
-            if ((int)p.inputs.size() >= MAX_QUEUED_INPUTS) p.inputs.pop_front();
-            p.inputs.push_back(in);
+            std::vector<InputMsg> received;
+            if (!decodeInput(r, received)) return;
+            // в пакете несколько последних вводов; берём только те, которых ещё не было
+            for (const InputMsg& in : received) {
+                if (in.seq <= p.lastReceivedSeq) continue;   // уже получали (дубль) или старый пакет
+                if (!std::isfinite(in.aim)) return;
+                p.lastReceivedSeq = in.seq;
+                // очередь ограничена: при переполнении выбрасываем самый СТАРЫЙ ввод,
+                // иначе задержка управления "застрянет" на максимуме
+                if ((int)p.inputs.size() >= MAX_QUEUED_INPUTS) p.inputs.pop_front();
+                p.inputs.push_back(in);
+            }
         } else if (type == MSG_LEAVE) {
             removePlayer(key, "left the game");
         }
@@ -190,7 +193,7 @@ public:
             s.players.push_back(ps);
         }
         for (const auto& b : bullets_) {
-            s.bullets.push_back({b.x, b.y, b.owner});
+            s.bullets.push_back({b.x, b.y, b.vx, b.vy, b.owner});
         }
 
         Writer w = encodeState(s);

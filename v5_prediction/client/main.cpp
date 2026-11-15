@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
 
     StateMsg latest;                 // самое свежее состояние (фаза, счёт, кто жив)
     bool haveState = false;
+    double latestAt = 0;             // когда (по нашим часам) пришло latest — для полёта своих пуль
 
     std::deque<Snapshot> snapshots;  // история для интерполяции (~1 с)
     RenderClock renderClock;         // какой момент сервера рисовать для соперника
@@ -168,6 +169,7 @@ int main(int argc, char** argv) {
                 if (haveState && s.tick <= latest.tick) continue;   // устаревший пакет
                 latest = s;
                 haveState = true;
+                latestAt = now;
                 renderClock.onSnapshot(s.tick, now, TICK_RATE);
 
                 snapshots.push_back({s.tick, s.players, s.bullets});
@@ -241,7 +243,12 @@ int main(int argc, char** argv) {
 
                     pending.push_back({in, now});
                     while (pending.size() > 120) pending.pop_front();   // сервер давно молчит — не копим бесконечно
-                    sendPacket(sock, server, encodeInput(in));
+                    // шлём этот ввод + несколько предыдущих (на случай потери пакетов)
+                    InputMsg recent[INPUT_REDUNDANCY];
+                    int count = 0;
+                    size_t first = pending.size() > (size_t)INPUT_REDUNDANCY ? pending.size() - INPUT_REDUNDANCY : 0;
+                    for (size_t i = first; i < pending.size(); i++) recent[count++] = pending[i].in;
+                    sendPacket(sock, server, encodeInput(recent, count));
                 }
             }
         }
@@ -283,8 +290,14 @@ int main(int argc, char** argv) {
         if (haveState) {
             // Пули: свои — из самого свежего состояния (меньше задержка после выстрела),
             // чужие — из того же момента, в котором рисуем соперника (чтобы попадания выглядели честно)
+            // Свою пулю досчитываем сами: позиция из пакета + скорость × время с его прихода.
+            // Иначе при залипании сети пуля висит в воздухе, а потом прыгает.
+            float flight = (float)std::min(now - latestAt, 0.3);
             for (const auto& b : latest.bullets) {
-                if (b.owner == myId) DrawCircleV(Vector2{b.x, b.y + HUD_HEIGHT}, BULLET_RADIUS, DARKBLUE);
+                if (b.owner != myId) continue;
+                float bx = b.x + b.vx * flight, by = b.y + b.vy * flight;
+                if (bx < 0 || by < 0 || bx > MAP_SIZE || by > MAP_SIZE) continue;   // уже улетела за стену
+                DrawCircleV(Vector2{bx, by + HUD_HEIGHT}, BULLET_RADIUS, DARKBLUE);
             }
             const std::vector<BulletState>& enemyBullets =
                 (interpolationOn && from) ? from->bullets : latest.bullets;

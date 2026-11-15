@@ -69,11 +69,11 @@ inline constexpr float INPUT_DT = 1.0f / TICK_RATE;
 // бюджет накапливается до MAX_INPUT_BURST, и пришедшая потом пачка применяется сразу —
 // задержка не "застревает". В среднем быстрее реального времени двигаться всё равно нельзя
 // (защита от speedhack: присылать вводы чаще бессмысленно).
-inline constexpr int MAX_INPUT_BURST = 16;    // ~0.27 с
+inline constexpr int MAX_INPUT_BURST = 30;    // ~0.5 с: Wi-Fi иногда залипает на 200–400 мс
 
 // Если в очереди накопилось больше — выбрасываем САМЫЕ СТАРЫЕ вводы,
-// чтобы задержка управления не могла вырасти выше ~0.33 с.
-inline constexpr int MAX_QUEUED_INPUTS = 20;
+// чтобы задержка управления не могла вырасти выше ~0.67 с.
+inline constexpr int MAX_QUEUED_INPUTS = 40;
 
 // Вводы, на которые нет бюджета, — это "хвост" после задержки сети дольше MAX_INPUT_BURST:
 // приток = отток, и сам он НИКОГДА не рассосётся (каждый следующий ввод будет ждать весь хвост).
@@ -196,20 +196,35 @@ struct InputMsg {
 inline Writer encodeHello() { Writer w; w.u8(MSG_HELLO); return w; }
 inline Writer encodeLeave() { Writer w; w.u8(MSG_LEAVE); return w; }
 
-inline Writer encodeInput(const InputMsg& m) {
+// В одном пакете INPUT лежат несколько ПОСЛЕДНИХ вводов (старые первыми).
+// UDP иногда теряет пакеты; если пакет с вводом №10 потерялся, ввод №10 приедет
+// ещё раз в пакетах №11, №12, №13 — и движение не пропадёт. Сервер берёт только новые (seq больше уже полученного).
+// Цена — пакет 1 + 1 + 4×9 = 38 байт вместо 10. Для 60 пакетов/с это копейки.
+inline constexpr int INPUT_REDUNDANCY = 4;
+
+inline Writer encodeInput(const InputMsg* inputs, int count) {
     Writer w;
     w.u8(MSG_INPUT);
-    w.u32(m.seq);
-    w.u8(m.keys);
-    w.f32(m.aim);
+    w.u8((uint8_t)count);
+    for (int i = 0; i < count; i++) {
+        w.u32(inputs[i].seq);
+        w.u8(inputs[i].keys);
+        w.f32(inputs[i].aim);
+    }
     return w;
 }
+inline Writer encodeInput(const InputMsg& m) { return encodeInput(&m, 1); }
 
 // Читает всё ПОСЛЕ байта типа
-inline bool decodeInput(Reader& r, InputMsg& m) {
-    m.seq = r.u32();
-    m.keys = r.u8();
-    m.aim = r.f32();
+inline bool decodeInput(Reader& r, std::vector<InputMsg>& out) {
+    uint8_t count = r.u8();
+    if (count == 0 || count > INPUT_REDUNDANCY) return false;
+    out.resize(count);
+    for (auto& m : out) {
+        m.seq = r.u32();
+        m.keys = r.u8();
+        m.aim = r.f32();
+    }
     return r.ok();
 }
 
@@ -225,6 +240,7 @@ struct PlayerState {
 
 struct BulletState {
     float x = 0, y = 0;
+    float vx = 0, vy = 0;   // скорость: клиент сам двигает пулю между пакетами
     uint8_t owner = 0;
 };
 
@@ -277,6 +293,8 @@ inline Writer encodeState(const StateMsg& s) {
     for (const auto& b : s.bullets) {
         w.f32(b.x);
         w.f32(b.y);
+        w.f32(b.vx);
+        w.f32(b.vy);
         w.u8(b.owner);
     }
     return w;
@@ -309,6 +327,8 @@ inline bool decodeState(Reader& r, StateMsg& s) {
     for (auto& b : s.bullets) {
         b.x = r.f32();
         b.y = r.f32();
+        b.vx = r.f32();
+        b.vy = r.f32();
         b.owner = r.u8();
     }
     return r.ok();
