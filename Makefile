@@ -25,7 +25,7 @@ CXXFLAGS := -std=c++17 -Wall -Wextra -O2
 BUILD := build
 
 # Эти цели — команды, а не файлы
-.PHONY: help build build-v2 build-v3 server-v2 client-v2 server-v3 client-v3 clean
+.PHONY: help build build-v2 build-v3 build-v4 build-v5 server-v2 client-v2 server-v3 client-v3 server-v4 client-v4 server-v5 client-v5 clean
 
 # ---------- Справка (запускается по умолчанию, просто "make") ----------
 
@@ -34,12 +34,18 @@ help:
 	@echo "  make build              собрать все версии"
 	@echo "  make build-v2           собрать v2 (события + время UTC)"
 	@echo "  make build-v3           собрать v3 (игра с победителем)"
+	@echo "  make build-v4           собрать v4 (стрелялка с окном, нужен: brew install raylib)"
+	@echo "  make build-v5           собрать v5 (v4 + prediction и интерполяция)"
 	@echo ""
 	@echo "Запуск (по умолчанию HOST=127.0.0.1 PORT=7777):"
 	@echo "  make server-v2 [PORT=7777]"
 	@echo "  make client-v2 [HOST=1.2.3.4] [PORT=7777]"
 	@echo "  make server-v3 [PORT=7777]"
 	@echo "  make client-v3 [HOST=1.2.3.4] [PORT=7777]"
+	@echo "  make server-v4 [PORT=7777]"
+	@echo "  make client-v4 [HOST=1.2.3.4] [PORT=7777]"
+	@echo "  make server-v5 [PORT=7777]"
+	@echo "  make client-v5 [HOST=1.2.3.4] [PORT=7777]"
 	@echo ""
 	@echo "  make clean              удалить папку $(BUILD)/"
 
@@ -81,6 +87,51 @@ server-v3: $(BUILD)/v3_server
 
 client-v3: $(BUILD)/v3_client
 	./$(BUILD)/v3_client $(HOST) $(PORT)
+
+# ---------- v4: реалтайм-стрелялка с окном (raylib) ----------
+#
+# Клиенту нужна библиотека raylib:  brew install raylib
+# Серверу raylib НЕ нужен — его можно собирать на Linux-сервере как обычно.
+
+# Где Homebrew хранит библиотеки (обычно /opt/homebrew).
+# "=" а не ":=" — команда brew выполнится, только когда собираем клиент v4.
+BREW_PREFIX   = $(shell brew --prefix 2>/dev/null)
+RAYLIB_CFLAGS = -I$(BREW_PREFIX)/include
+RAYLIB_LIBS   = -L$(BREW_PREFIX)/lib -lraylib
+
+build-v4: $(BUILD)/v4_server $(BUILD)/v4_client
+
+$(BUILD)/v4_server: v4_shooter/server/main.cpp v4_shooter/common/protocol.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) v4_shooter/server/main.cpp -o $(BUILD)/v4_server
+
+$(BUILD)/v4_client: v4_shooter/client/main.cpp v4_shooter/common/protocol.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(RAYLIB_CFLAGS) v4_shooter/client/main.cpp -o $(BUILD)/v4_client $(RAYLIB_LIBS)
+
+server-v4: $(BUILD)/v4_server
+	./$(BUILD)/v4_server $(PORT)
+
+client-v4: $(BUILD)/v4_client
+	./$(BUILD)/v4_client $(HOST) $(PORT)
+
+# ---------- v5: v4 + client-side prediction и интерполяция ----------
+
+build-v5: $(BUILD)/v5_server $(BUILD)/v5_client
+
+$(BUILD)/v5_server: v5_prediction/server/main.cpp v5_prediction/common/protocol.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) v5_prediction/server/main.cpp -o $(BUILD)/v5_server
+
+$(BUILD)/v5_client: v5_prediction/client/main.cpp v5_prediction/common/protocol.h
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) $(RAYLIB_CFLAGS) v5_prediction/client/main.cpp -o $(BUILD)/v5_client $(RAYLIB_LIBS)
+
+server-v5: $(BUILD)/v5_server
+	./$(BUILD)/v5_server $(PORT)
+
+client-v5: $(BUILD)/v5_client
+	./$(BUILD)/v5_client $(HOST) $(PORT)
 
 # ---------- Очистка ----------
 
