@@ -299,8 +299,8 @@ int main(int argc, char** argv) {
 
                 Vector2 pos{x, y + HUD_HEIGHT};
                 Color body = !p.alive ? LIGHTGRAY : (p.id == myId ? BLUE : RED);
-                Vector2 tip{pos.x + std::cos(aim) * (PLAYER_RADIUS + 14),
-                            pos.y + std::sin(aim) * (PLAYER_RADIUS + 14)};
+                Vector2 tip{pos.x + std::cos(aim) * GUN_LENGTH,
+                            pos.y + std::sin(aim) * GUN_LENGTH};
                 DrawLineEx(pos, tip, 4, DARKGRAY);
                 DrawCircleV(pos, PLAYER_RADIUS, body);
                 DrawText(p.id == myId ? "you" : TextFormat("P%d", p.id),

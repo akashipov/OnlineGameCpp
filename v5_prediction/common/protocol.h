@@ -49,6 +49,9 @@ inline constexpr float MAP_SIZE        = 800.0f;   // карта MAP_SIZE x MAP_
 inline constexpr float PLAYER_RADIUS   = 16.0f;
 inline constexpr float PLAYER_SPEED    = 260.0f;   // единиц карты в секунду
 inline constexpr float BULLET_RADIUS   = 4.0f;
+// Длина ствола от центра игрока. Клиент рисует ствол такой длины, сервер создаёт пулю
+// на его конце — поэтому пуля вылетает ровно из дула.
+inline constexpr float GUN_LENGTH      = PLAYER_RADIUS + 14.0f;
 inline constexpr float BULLET_SPEED    = 450.0f;   // единиц в секунду: через всю карту ~1.8 с, можно увернуться
 inline constexpr float BULLET_LIFETIME = 2.0f;     // секунд (450 * 2 = 900 > размера карты)
 inline constexpr float SHOOT_COOLDOWN  = 0.35f;    // секунд между выстрелами

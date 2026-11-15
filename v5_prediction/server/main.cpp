@@ -366,7 +366,7 @@ private:
             if ((int)bullets_.size() >= MAX_BULLETS) return;
 
             float cx = std::cos(p.aim), cy = std::sin(p.aim);
-            float start = PLAYER_RADIUS + BULLET_RADIUS + 2;
+            float start = GUN_LENGTH;   // пуля появляется на конце ствола
             bullets_.push_back({p.x + cx * start, p.y + cy * start,
                                 cx * BULLET_SPEED, cy * BULLET_SPEED,
                                 BULLET_LIFETIME, p.id});
