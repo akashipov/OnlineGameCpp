@@ -41,6 +41,7 @@ void onSignal(int sig) { lastSignal = sig; }
 
 struct Player {
     uint8_t id = 0;                  // 1 или 2
+    uint32_t token = 0;              // случайный номер сессии клиента — по нему узнаём его с нового адреса
     sockaddr_in addr{};
     float x = 0, y = 0, aim = 0;
     uint8_t score = 0;
@@ -95,15 +96,24 @@ public:
         auto it = players_.find(key);
 
         if (type == MSG_HELLO) {
+            uint32_t token = r.u32();
+            if (!r.ok() || token == 0) return;
             if (it != players_.end()) {
                 send(from, encodeWelcome(it->second.id));
                 return;
+            }
+            // Тот же игрок, но с нового адреса (роутер сменил порт / клиент пересоздал сокет)
+            for (auto old = players_.begin(); old != players_.end(); ++old) {
+                if (old->second.token == token) {
+                    rebindPlayer(old, key, from);
+                    return;
+                }
             }
             if ((int)players_.size() >= MAX_PLAYERS) {
                 send(from, encodeFull());
                 return;
             }
-            addPlayer(key, from);
+            addPlayer(key, from, token);
             return;
         }
 
@@ -145,6 +155,15 @@ public:
 
         processInputs(elapsed);   // движение — здесь, ровно по присланным вводам
 
+        // От кого-то давно ничего нет (связь пропала) → автопауза
+        bool someoneSilent = false;
+        for (const auto& [key, p] : players_) {
+            if (std::chrono::duration<float>(now - p.lastSeen).count() > PAUSE_AFTER_SEC) {
+                someoneSilent = true;
+                if (phase_ == PHASE_PLAYING || phase_ == PHASE_COUNTDOWN) pause(p.id);
+            }
+        }
+
         switch (phase_) {
             case PHASE_WAITING:
                 break;
@@ -165,6 +184,26 @@ public:
                 if (phaseTimer_ <= 0) {
                     if (round_ >= ROUNDS_TOTAL) endGame();
                     else { round_++; startRound(); }
+                }
+                break;
+
+            case PHASE_PAUSED:
+                // Пули не летят, игроки не двигаются (canMove/canShoot не пускают в этой фазе).
+                if (someoneSilent) {
+                    resuming_ = false;
+                    phaseTimer_ = 0;               // timeLeftMs = 0 → клиенты пишут "ждём игрока"
+                } else {
+                    if (!resuming_) {
+                        resuming_ = true;
+                        phaseTimer_ = RESUME_TIME;
+                        logLine("Connection is back, resuming");
+                    }
+                    phaseTimer_ -= dt;
+                    if (phaseTimer_ <= 0) {
+                        phase_ = pausedFrom_;      // продолжаем с того же места
+                        phaseTimer_ = pausedTimer_;
+                        logLine("Game resumed");
+                    }
                 }
                 break;
         }
@@ -272,13 +311,14 @@ private:
 
     // ---------- Игроки ----------
 
-    void addPlayer(uint64_t key, const sockaddr_in& from) {
+    void addPlayer(uint64_t key, const sockaddr_in& from, uint32_t token) {
         uint8_t id = 1;
         for (const auto& [k, p] : players_) if (p.id == 1) id = 2;
 
         Player p;
         p.arrival.decay = 0.01;   // буфер вводов сжимается за ~2 с после разовой заминки
         p.id = id;
+        p.token = token;
         p.addr = from;
         p.lastSeen = Clock::now();
         spawn(p);
@@ -288,6 +328,18 @@ private:
         send(from, encodeWelcome(id));
 
         if ((int)players_.size() == MAX_PLAYERS && phase_ == PHASE_WAITING) startGame();
+    }
+
+    // Переносим игрока на новый адрес: позиция, счёт, вводы — всё остаётся, игра продолжается
+    void rebindPlayer(std::unordered_map<uint64_t, Player>::iterator old, uint64_t newKey, const sockaddr_in& from) {
+        Player p = std::move(old->second);
+        players_.erase(old);
+        logLine("P" + std::to_string(p.id) + " reconnected: " + addrToString(p.addr) + " -> " + addrToString(from));
+        p.addr = from;
+        p.lastSeen = Clock::now();
+        uint8_t id = p.id;
+        players_[newKey] = std::move(p);
+        send(from, encodeWelcome(id));
     }
 
     void removePlayer(uint64_t key, const std::string& reason) {
@@ -302,7 +354,7 @@ private:
         auto now = Clock::now();
         std::vector<uint64_t> silent;
         for (const auto& [key, p] : players_) {
-            if (now - p.lastSeen > std::chrono::seconds(5)) silent.push_back(key);
+            if (now - p.lastSeen > std::chrono::seconds(PLAYER_TIMEOUT_SEC)) silent.push_back(key);
         }
         for (uint64_t key : silent) removePlayer(key, "timed out");
     }
@@ -314,6 +366,17 @@ private:
         p.alive = true;
         p.fireCooldown = 0;
         p.hasShot = false;
+    }
+
+    // ---------- Автопауза ----------
+
+    void pause(uint8_t silentId) {
+        pausedFrom_ = phase_;          // PLAYING или COUNTDOWN — куда вернуться
+        pausedTimer_ = phaseTimer_;    // сколько оставалось от отсчёта раунда
+        phase_ = PHASE_PAUSED;
+        phaseTimer_ = 0;
+        resuming_ = false;
+        logLine("Game paused: P" + std::to_string(silentId) + " is not responding");
     }
 
     // ---------- Раунды ----------
@@ -421,6 +484,9 @@ private:
     std::vector<Bullet> bullets_;
     Phase phase_ = PHASE_WAITING;
     float phaseTimer_ = 0;
+    Phase pausedFrom_ = PHASE_PLAYING;   // автопауза: в какую фазу вернуться
+    float pausedTimer_ = 0;              // и сколько в ней оставалось
+    bool resuming_ = false;              // связь вернулась, идёт отсчёт до продолжения
     int round_ = 0;
     uint8_t lastScorer_ = 0;
     uint32_t tick_ = 0;

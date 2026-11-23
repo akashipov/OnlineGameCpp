@@ -29,7 +29,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #include <deque>
+#include <random>
 #include <vector>
 
 #include "raylib.h"
@@ -68,6 +70,26 @@ struct Snapshot {
     std::vector<PlayerState> players;
     std::vector<BulletState> bullets;
 };
+
+// На каком тике сервера пуля появилась (≈ тик выстрела).
+// Идём по снимкам от свежих к старым, пока в них есть "та же" пуля: тот же владелец,
+// та же скорость и позиция, отмотанная назад по прямой.
+double bulletSpawnTick(const BulletState& b, uint32_t tick, const std::deque<Snapshot>& snaps) {
+    double spawn = tick;
+    for (auto it = snaps.rbegin(); it != snaps.rend(); ++it) {
+        if (it->tick > tick) continue;
+        float back = (float)(tick - it->tick) / TICK_RATE;
+        float ex = b.x - b.vx * back, ey = b.y - b.vy * back;   // где пуля была бы на том тике
+        bool found = false;
+        for (const auto& o : it->bullets) {
+            if (o.owner == b.owner && sameShot(o, {0, 0, b.vx, b.vy}) &&
+                std::fabs(o.x - ex) < 2.0f && std::fabs(o.y - ey) < 2.0f) { found = true; break; }
+        }
+        if (!found) break;
+        spawn = it->tick;
+    }
+    return spawn;
+}
 
 void sendPacket(UdpClient& net, const Writer& w) {
     net.send(w.data(), w.size());
@@ -137,6 +159,14 @@ int main(int argc, char** argv) {
     double rttMs = 0;                // оценка пинга
     double lastHelloAt = -10;
     double lastPacketAt = GetTime();
+    double lastReopenAt = GetTime();  // когда последний раз пересоздавали сокет (при долгой потере связи)
+
+    // Случайный номер сессии: по нему сервер узнает нас, даже если сменился адрес (см. encodeHello)
+    std::random_device rd;
+    uint32_t sessionToken = 0;
+    while (sessionToken == 0) {
+        sessionToken = rd() ^ (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    }
 
     while (!WindowShouldClose()) {
         double now = GetTime();
@@ -146,6 +176,17 @@ int main(int argc, char** argv) {
             myBullets.clear();   // без предсказания свои пули снова рисуются из снимков сервера
         }
         if (IsKeyPressed(KEY_I)) interpolationOn = !interpolationOn;
+
+        // ---------- 0. Потеря связи ----------
+        // Сколько уже ничего не приходит от сервера (до приёма пакетов этого кадра)
+        double silence = now - lastPacketAt;
+        // Совсем долго тихо — пересоздаём сокет: получим новый локальный порт и новую запись в NAT роутера.
+        // Сервер узнает нас по sessionToken в HELLO и перенесёт на новый адрес.
+        if (myId != 0 && !gameOver && silence > 3.0 && now - lastReopenAt > 3.0) {
+            net.close();
+            net.open(host, port);   // не получилось (сеть совсем пропала) — попробуем через 3 с
+            lastReopenAt = now;
+        }
 
         // ---------- 1. Приём ----------
         while (true) {
@@ -158,7 +199,21 @@ int main(int argc, char** argv) {
             uint8_t type = r.u8();
 
             if (type == SRV_WELCOME) {
-                myId = r.u8();
+                uint8_t id = r.u8();
+                if (!r.ok()) continue;
+                // Первое подключение или ПЕРЕподключение: всё, что знали о мире, могло устареть.
+                // Важно сбросить haveState: если сервер перезапускался, его тики начались с нуля,
+                // и без сброса мы бы выбрасывали все новые снимки как "старые" (s.tick <= latest.tick).
+                // inputSeq НЕ сбрасываем: сервер (если помнит нас) ждёт номера больше прежних.
+                if (myId == 0 || id != myId || silence > 1.0) {
+                    haveState = false;
+                    snapshots.clear();
+                    renderClock = RenderClock{};
+                    pending.clear();
+                    havePrediction = false;
+                    myBullets.clear();
+                }
+                myId = id;
             } else if (type == SRV_FULL) {
                 serverFull = true;
             } else if (type == SRV_GAME_END && !gameOver) {
@@ -230,12 +285,13 @@ int main(int argc, char** argv) {
 
         // ---------- 2. Отправка: ровно 60 вводов в секунду, независимо от FPS ----------
         if (!gameOver && !serverFull) {
-            if (myId == 0) {
-                if (now - lastHelloAt > 0.5) {
-                    sendPacket(net, encodeHello());
-                    lastHelloAt = now;
-                }
-            } else {
+            // HELLO: пока не подключились, а также если сервер молчит больше 1 с (переподключение).
+            // Вводы при этом продолжаем слать — если связь вернулась сама, сервер их сразу примет.
+            if ((myId == 0 || now - lastPacketAt > 1.0) && now - lastHelloAt > 0.5) {
+                sendPacket(net, encodeHello(sessionToken));
+                lastHelloAt = now;
+            }
+            if (myId != 0) {
                 inputAccumulator += GetFrameTime();
                 if (inputAccumulator > 0.25) inputAccumulator = 0.25;   // после долгой паузы не "отстреливаем" сотню вводов
 
@@ -340,10 +396,55 @@ int main(int argc, char** argv) {
                 if (bx < 0 || by < 0 || bx > MAP_SIZE || by > MAP_SIZE) continue;   // уже улетела за стену
                 DrawCircleV(Vector2{bx, by + HUD_HEIGHT}, BULLET_RADIUS, DARKBLUE);
             }
-            const std::vector<BulletState>& enemyBullets =
-                (interpolationOn && from) ? from->bullets : latest.bullets;
-            for (const auto& b : enemyBullets) {
-                if (b.owner != myId) DrawCircleV(Vector2{b.x, b.y + HUD_HEIGHT}, BULLET_RADIUS, MAROON);
+            // ЧУЖИЕ ПУЛИ: в каком моменте времени их рисовать.
+            // На экране два "времени":
+            //   enemyTick — в нём рисуем соперника (интерполяция, в прошлом на ping/2 + interp);
+            //   myTick    — в нём рисуем себя (предсказание: latest.tick + неподтверждённые вводы).
+            // Между ними ping + interp — пуля успевает пролететь сотню единиц.
+            // Попадание решается только РЯДОМ С ТОБОЙ, поэтому:
+            //   у дула врага пуля в enemyTick — вылетает из ствола, когда он стреляет на экране;
+            //   подлетая к тебе, плавно переходит в myTick (чуть ускоряется);
+            //   в точке, где ближе всего к тебе, она уже целиком в myTick — касание = попадание на сервере.
+            // Пуля летит по прямой, поэтому её позицию на любом тике можно посчитать точно.
+            const double latestTick = latest.tick;
+            // Не PLAYING (пауза, отсчёт) — пули на сервере стоят, рисуем их там, где стоят
+            const bool flying = latest.phase == PHASE_PLAYING;
+            const double enemyTick = (interpolationOn && flying) ? std::min(renderTick, latestTick) : latestTick;
+            const double myTick = (predictionOn && havePrediction && flying) ? latestTick + (double)pending.size() : latestTick;
+            const float BLEND_DIST = 250.0f;   // за сколько единиц до тебя пуля начинает "догонять" твоё время
+
+            for (const auto& b : latest.bullets) {
+                if (b.owner == myId) continue;
+                float speed = std::hypot(b.vx, b.vy);
+                if (speed < 1.0f) continue;
+                float dirX = b.vx / speed, dirY = b.vy / speed;
+                auto posAt = [&](double tick, float& x, float& y) {
+                    float dt = (float)((tick - latestTick) / TICK_RATE);
+                    x = b.x + b.vx * dt;
+                    y = b.y + b.vy * dt;
+                };
+
+                double spawnTick = bulletSpawnTick(b, latest.tick, snapshots);
+
+                // s — сколько пуле ещё лететь до точки, где она ближе всего к тебе (в твоём времени).
+                // Летит мимо/от тебя с самого вылета — переход не нужен, рисуем в времени соперника.
+                float sx, sy, mx, my;
+                posAt(spawnTick, sx, sy);
+                posAt(myTick, mx, my);
+                float sFromSpawn = (myX - sx) * dirX + (myY - sy) * dirY;
+                float s = (myX - mx) * dirX + (myY - my) * dirY;
+                float w = 0;
+                if (sFromSpawn > 0) {
+                    w = s <= 0 ? 1.0f : std::clamp(1.0f - s / BLEND_DIST, 0.0f, 1.0f);
+                    w = w * w * (3 - 2 * w);   // smoothstep: ускорение без рывка
+                }
+
+                double drawTick = enemyTick + (myTick - enemyTick) * w;
+                if (drawTick < spawnTick) continue;   // в этом моменте враг ещё не выстрелил
+                float bx, by;
+                posAt(drawTick, bx, by);
+                if (bx < 0 || by < 0 || bx > MAP_SIZE || by > MAP_SIZE) continue;   // уже улетела за стену
+                DrawCircleV(Vector2{bx, by + HUD_HEIGHT}, BULLET_RADIUS, MAROON);
             }
 
             for (const auto& p : latest.players) {
@@ -417,13 +518,22 @@ int main(int argc, char** argv) {
         } else if (myId == 0) {
             drawCentered(TextFormat("Connecting to %s:%d ...", host, port), midY, 30, DARKGRAY);
         } else if (now - lastPacketAt > 3.0) {
-            drawCentered("Connection lost...", midY, 40, MAROON);
+            drawCentered("Connection lost, reconnecting...", midY, 36, MAROON);
+            drawCentered(TextFormat("no data for %.0f s (server waits %d s)", now - lastPacketAt, PLAYER_TIMEOUT_SEC),
+                         midY + 50, 20, GRAY);
         } else if (haveState) {
             if (latest.phase == PHASE_WAITING) {
                 drawCentered("Waiting for opponent...", midY, 30, DARKGRAY);
             } else if (latest.phase == PHASE_COUNTDOWN) {
                 drawCentered(TextFormat("Round %d", latest.round), midY, 50, DARKGRAY);
                 drawCentered(TextFormat("%.1f", latest.timeLeftMs / 1000.0f), midY + 60, 30, GRAY);
+            } else if (latest.phase == PHASE_PAUSED) {
+                drawCentered("PAUSED", midY, 50, DARKGRAY);
+                if (latest.timeLeftMs == 0)
+                    drawCentered("A player lost connection, waiting...", midY + 60, 24, GRAY);
+                else
+                    drawCentered(TextFormat("Connection is back. Resuming in %.1f", latest.timeLeftMs / 1000.0f),
+                                 midY + 60, 24, DARKGREEN);
             } else if (latest.phase == PHASE_ROUND_OVER) {
                 const char* text = latest.lastScorer == 0    ? "Both hit!"
                                  : latest.lastScorer == myId ? "You hit!"
